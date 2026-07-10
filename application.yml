@@ -1,0 +1,191 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: "Application layer"
+
+Parameters:
+
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+
+  NetworkParameter:
+    Type: String
+    Default: networking-stack
+
+  InstanceTypeParameter:
+    Description: Enter t2.micro, t2.small, t3.micro, t3.small. Default is t2.small
+    Type: String
+    Default: t2.small
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t3.micro
+      - t3.small
+
+  DesiredCapacity:
+    Type: Number
+    Default: 6
+
+  MinCapacity:
+    Type: Number
+    Default: 6
+
+  MaxCapacity:
+    Type: Number
+    Default: 10
+
+
+Resources:
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable access from ALB Security Group
+      VpcId:
+        Fn::ImportValue: !Sub "${NetworkParameter}-VpcID"
+      Tags:
+        - Key: Name
+          Value: SG
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName:
+        !Sub "${AWS::StackName}-LaunchTemplate"
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceTypeParameter
+        SecurityGroupIds:
+          - !Ref InstanceSecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y httpd
+            systemctl enable httpd
+            systemctl start httpd
+            echo "Hello from $(hostname)" > /var/www/html/index.html
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName:
+        !Sub "${AWS::StackName}-ASG"
+      LaunchTemplate: 
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      DesiredCapacity: !Ref DesiredCapacity
+      MinSize: !Ref MinCapacity
+      MaxSize: !Ref MaxCapacity
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub "${NetworkParameter}-PrivateAppSubnetAID"
+        - Fn::ImportValue: !Sub "${NetworkParameter}-PrivateAppSubnetBID"
+      TargetGroupARNs:
+        - !Ref ALBTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: AppServerInstance
+          PropagateAtLaunch: true
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+          MinInstancesInService: "2"  # Keeps baseline capacity alive during updates
+          MaxBatchSize: "1"           # Replaces 1 instance at a time
+          MinSuccessfulInstancesPercent: "100"
+          SuspendProcesses:
+            - ScheduledActions
+          WaitOnResourceSignals: false
+
+  ScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration: 
+        PredefinedMetricSpecification: 
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 50
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow Public HTTP traffic to ALB
+      VpcId:
+        Fn::ImportValue: 
+          !Sub "${NetworkParameter}-VpcID"
+      Tags:
+        - Key: Name
+          Value: ALBSG
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: AppALB
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets:
+        - Fn::ImportValue: !Sub "${NetworkParameter}-PublicSubnetAID"
+        - Fn::ImportValue: !Sub "${NetworkParameter}-PublicSubnetBID"
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: AppTargetGroup
+      VpcId:
+        Fn::ImportValue: 
+          !Sub "${NetworkParameter}-VpcID"
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: "80"
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 3
+      UnhealthyThresholdCount: 2
+
+  AppListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+
+Outputs:
+
+  LoadBalancerDNS:
+    Description: DNS name of the ALB
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export: 
+      Name: !Sub ${AWS::StackName}-LoadBalancerDNS
+
+  LoadBalancerArn:
+    Value: !Ref ApplicationLoadBalancer
+
+  TargetGroupArn:
+    Value: !Ref ALBTargetGroup
+
+  SecurityGroup:
+    Description: Application security group
+    Value: !Ref InstanceSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-SecurityGroup

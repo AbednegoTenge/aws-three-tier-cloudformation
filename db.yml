@@ -1,0 +1,99 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Database layer
+
+Parameters:
+
+  DBName:
+    Type: String
+    Default: mydb
+  
+  DBUsername:
+    Type: String
+    Default: postgres
+
+  NetworkParameter:
+    Type: String
+    Default: networking-stack
+
+  ApplicationParameter:
+    Type: String
+    Default: application-stack
+
+Resources:
+
+  KMS:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: "A key for encrypting database"
+      Enabled: true
+      EnableKeyRotation: true
+      KeySpec: SYMMETRIC_DEFAULT
+      RotationPeriodInDays: 90
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: database-kms-policy
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: KMS
+
+  KMSAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${AWS::StackName}-app-db-key"
+      TargetKeyId: !Ref KMS
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow PostgreSQL from App Servers
+      VpcId:
+        Fn::ImportValue: !Sub '${NetworkParameter}-VpcID'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId:
+            Fn::ImportValue: !Sub '${ApplicationParameter}-SecurityGroup'
+      Tags:
+        - Key: Name
+          Value: DBSG
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: postgres
+      EngineVersion: "18.4"
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: 20
+      DBName: !Ref DBName
+      MasterUsername: !Ref DBUsername
+      ManageMasterUserPassword: true
+      MultiAZ: true
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 7
+      DBSubnetGroupName: 
+        Fn::ImportValue: !Sub '${NetworkParameter}-DBSubnetGroup'
+      KmsKeyId: !GetAtt KMS.Arn
+      StorageEncrypted: true
+      DeletionProtection: false
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      Tags:
+        - Key: Name
+          Value: AppDB
+      
+Outputs:
+  DatabaseEndpoint:
+    Description: "The connection endpoint for the database"
+    Value: !GetAtt Database.Endpoint.Address
+
+  DatabaseSecretArn:
+    Description: "The ARN of the AWS Secrets Manager secret holding the password"
+    Value: !GetAtt Database.MasterUserSecret.SecretArn
